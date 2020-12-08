@@ -1,0 +1,121 @@
+FASTQ, = glob_wildcards("data/fastq/{sample}.fastq")
+
+rule all:
+    input:
+        "output/merged.fastq",
+        "output/merged_filtlong.fastq",
+        "output/flye",
+        "output/flye/assembly.fasta",
+        "output/draft.fasta",
+        "output/reads.sorted.bam",
+        "output/nanopolish.index",
+        "output/nanopolish.results",
+        "output/polished_genome.fasta"
+
+rule fastq_merge:
+    input:
+        expand("data/fastq/{sample}.fastq", sample=FASTQ)
+    output:
+        "output/merged.fastq"
+    shell:
+        "cat {input} > {output}"
+
+rule filtlong_reads:
+    input:
+        "output/merged.fastq"
+    output:
+        "output/merged_filtlong.fastq"
+    conda:
+        "env/nanopore.yaml"
+    shell:
+        "filtlong --min_length 3000 --min_mean_q 30 --length_weight 10 -p 90 "
+        "--target_bases 500000000 {input} > {output}"
+
+rule flye:
+    input:
+        "output/merged_filtlong.fastq"
+    output:
+        dir=directory("output/flye"),
+        assembly="output/flye/assembly.fasta"
+    conda:
+        "env/nanopore.yaml"
+    shell:
+        "flye --nano-raw {input} --out-dir {output.dir} --genome-size 3m --threads 8 --iterations 5"
+
+rule draft:
+    input:
+        "output/flye/assembly.fasta"
+    output:
+        "output/draft.fasta"
+    conda:
+        "env/nanopore.yaml"
+    shell:
+        "samtools faidx {input} contig_1 > {output}"
+
+rule bwa:
+    input:
+        reads="output/merged_filtlong.fastq",
+        draft="output/draft.fasta"
+    output:
+        "output/reads.sorted.bam"
+    conda:
+        "env/nanopore.yaml"
+    shell:
+        """
+        bwa index {input.draft}
+
+        bwa mem -x ont2d -t 4 {input.draft} {input.reads} | \
+        samtools sort -o {output} -T reads.tmp
+
+        samtools index {output}
+        """
+
+rule nanopolish_index:
+    input:
+        reads="output/merged_filtlong.fastq",
+        summary="data/fastq/sequencing_summary.txt"
+    output:
+        "output/nanopolish.index"
+    conda:
+        "env/nanopore.yaml"
+    shell:
+        "nanopolish index -d data/fast5 {input.reads} "
+        "-s {input.summary}"
+
+rule nanopolish_makerange:
+    input:
+        reads="output/merged_filtlong.fastq",
+        draft="output/draft.fasta",
+        bam="output/reads.sorted.bam",
+        summary="data/fastq/sequencing_summary.txt"
+    output:
+        directory("output/nanopolish.results")
+    conda:
+        "env/nanopore.yaml"
+    shell:
+        """
+        nanopolish index -d data/fast5 {input.reads} -s {input.summary}
+
+        python /Users/han/snakemake/nanopore/nanopolish_makerange.py \
+        {input.draft} | parallel --results {output} -P 2 \
+        nanopolish variants --consensus \
+        -o polished.{{1}}.vcf -w {{1}} -r {input.reads} -b {input.bam} \
+        -g {input.draft} -t 8 --min-candidate-frequency 0.1
+
+        touch polished.*.vcf
+        """
+
+CHUNKS, = glob_wildcards("polished.{chunk}.vcf")
+
+rule nanopolish:
+    input:
+        draft="output/draft.fasta",
+        vcf=expand("polished.{chunk}.vcf", chunk=CHUNKS),
+        range="output/nanopolish.results"
+    output:
+        "output/polished_genome.fasta"
+    conda:
+        "env/nanopore.yaml"
+    shell:
+        "nanopolish vcf2fasta -g {input.draft} "
+        "{input.vcf} > {output}"
